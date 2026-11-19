@@ -9,7 +9,9 @@ name: Approve network remediation
 
 on:
   issues:
-    types: [opened, labeled]
+    # Dynatrace opens the issue with its label already set, which GitHub reports as both
+    # "opened" and "labeled": listen to the label only, so one issue is one approval.
+    types: [labeled]
 
 concurrency:
   group: remediation-${{ github.event.issue.number }}
@@ -22,7 +24,7 @@ permissions:
 jobs:
   approve:
     if: >-
-      contains(github.event.issue.labels.*.name, 'network-remediation') &&
+      github.event.label.name == 'network-remediation' &&
       !contains(github.event.issue.labels.*.name, 'approved')
     runs-on: ubuntu-latest
     environment: network-change
