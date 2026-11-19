@@ -1,0 +1,68 @@
+# Approves a network remediation that Dynatrace proposed, through GitHub's protected environment.
+#
+# Dynatrace opens an issue labelled "network-remediation" (title contains the problem id). This
+# job waits on the "network-change" environment, so a required reviewer has to click Approve in
+# GitHub. Then it runs the Dynatrace approval workflow with the problem id and the reviewer's
+# login; the automation runner in the network applies the fix, and Dynatrace comments the
+# verified result back here and closes the issue.
+name: Approve network remediation
+
+on:
+  issues:
+    types: [opened, labeled]
+
+concurrency:
+  group: remediation-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+permissions:
+  issues: write
+  actions: read
+
+jobs:
+  approve:
+    if: >-
+      contains(github.event.issue.labels.*.name, 'network-remediation') &&
+      !contains(github.event.issue.labels.*.name, 'approved')
+    runs-on: ubuntu-latest
+    environment: network-change
+    steps:
+      - name: Find the problem and the approver
+        id: who
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: ${{ github.event.issue.title }}
+        run: |
+          problem=$(printf '%s' "$TITLE" | grep -oE 'P-[0-9]+' | head -1)
+          [ -n "$problem" ] || { echo "no problem id in the issue title"; exit 1; }
+          login=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/approvals" --jq '.[0].user.login // "unknown"')
+          echo "problem=$problem" >> "$GITHUB_OUTPUT"
+          echo "login=$login" >> "$GITHUB_OUTPUT"
+
+      - name: Run the Dynatrace approval workflow
+        env:
+          DT_ENV_URL: ${{ secrets.DT_ENV_URL }}
+          DT_SSO_URL: ${{ secrets.DT_SSO_URL }}
+          DT_CLIENT_ID: ${{ secrets.DT_CLIENT_ID }}
+          DT_CLIENT_SECRET: ${{ secrets.DT_CLIENT_SECRET }}
+          DT_ACCOUNT_URN: ${{ secrets.DT_ACCOUNT_URN }}
+          DT_APPROVE_WORKFLOW_ID: ${{ secrets.DT_APPROVE_WORKFLOW_ID }}
+          PROBLEM: ${{ steps.who.outputs.problem }}
+          APPROVER: github:${{ steps.who.outputs.login }}
+        run: |
+          token=$(curl -fsS -X POST "${DT_SSO_URL}/sso/oauth2/token" \
+            -d grant_type=client_credentials -d client_id="$DT_CLIENT_ID" --data-urlencode client_secret="$DT_CLIENT_SECRET" \
+            -d scope="automation:workflows:run automation:workflows:read" -d resource="$DT_ACCOUNT_URN" | jq -r .access_token)
+          echo "::add-mask::$token"
+          body=$(jq -n --arg p "$PROBLEM" --arg a "$APPROVER" '{input: {problem: $p, approver: $a}}')
+          curl -fsS -o /dev/null -X POST "${DT_ENV_URL}/platform/automation/v1/workflows/${DT_APPROVE_WORKFLOW_ID}/run" \
+            -H "Authorization: Bearer $token" -H "Content-Type: application/json" -d "$body"
+
+      - name: Mark the issue approved
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LOGIN: ${{ steps.who.outputs.login }}
+        run: |
+          gh issue edit "${{ github.event.issue.number }}" -R "$GITHUB_REPOSITORY" --add-label approved
+          gh issue comment "${{ github.event.issue.number }}" -R "$GITHUB_REPOSITORY" \
+            --body "Approved by ${LOGIN} in the network-change environment. Dynatrace's automation runner applies the fix; the verified result is posted here."
